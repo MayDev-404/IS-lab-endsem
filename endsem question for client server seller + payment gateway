@@ -1,0 +1,348 @@
+# paillier_gateway_sim.py
+import socket, threading, json, time
+from Crypto.Util import number
+from Crypto.Random import random
+from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
+from Crypto.Hash import SHA256
+from Crypto.Util.number import inverse, GCD
+
+# ---------------- Paillier Implementation ----------------
+class PaillierPublicKey:
+    def __init__(self, n, g):
+        self.n = n
+        self.g = g
+        self.n_sq = n * n
+
+class PaillierPrivateKey:
+    def __init__(self, public_key, lam, mu):
+        self.public_key = public_key
+        self.lam = lam
+        self.mu = mu
+
+def l_function(u, n):
+    return (u - 1) // n
+
+def generate_paillier_keypair(bits=512):
+    # generate two large primes p, q
+    p = number.getPrime(bits)
+    q = number.getPrime(bits)
+    n = p * q
+    n_sq = n * n
+    lam = (p - 1) * (q - 1) // number.GCD(p - 1, q - 1)  # lcm
+    g = n + 1  # simple choice
+    # compute mu = (L(g^lambda mod n^2))^{-1} mod n
+    x = pow(g, lam, n_sq)
+    L = l_function(x, n)
+    mu = inverse(L, n)
+    pub = PaillierPublicKey(n, g)
+    priv = PaillierPrivateKey(pub, lam, mu)
+    return pub, priv
+
+def paillier_encrypt(pub: PaillierPublicKey, m: int):
+    n = pub.n
+    n_sq = pub.n_sq
+    # choose random r in [1, n-1] with gcd(r,n)==1
+    while True:
+        r = random.StrongRandom().randint(1, n - 1)
+        if GCD(r, n) == 1:
+            break
+    c1 = pow(pub.g, m, n_sq)
+    c2 = pow(r, n, n_sq)
+    c = (c1 * c2) % n_sq
+    return c
+
+def paillier_decrypt(priv: PaillierPrivateKey, c: int):
+    n = priv.public_key.n
+    n_sq = priv.public_key.n_sq
+    lam = priv.lam
+    mu = priv.mu
+    x = pow(c, lam, n_sq)
+    L = l_function(x, n)
+    m = (L * mu) % n
+    return int(m)
+
+def paillier_homomorphic_add(pub: PaillierPublicKey, c1: int, c2: int):
+    return (c1 * c2) % pub.n_sq
+
+# ---------------- Server (Payment Gateway) ----------------
+HOST = '127.0.0.1'
+PORT = 65432
+
+class GatewayServer:
+    def __init__(self, host=HOST, port=PORT, expected_sellers=2):
+        self.host = host
+        self.port = port
+        self.expected_sellers = expected_sellers
+
+        # Paillier keys (gateway holds private key)
+        self.paillier_pub, self.paillier_priv = generate_paillier_keypair(bits=512)
+
+        # RSA keypair for signing
+        self.rsa_key = RSA.generate(2048)
+        self.rsa_pub = self.rsa_key.publickey()
+
+        # storage for sellers' data
+        self.lock = threading.Lock()
+        self.seller_data = {}   # seller_name -> { 'ciphertexts': [...], 'decrypted': [...], 'total_cipher': str, 'total_decrypted': int }
+        self.client_sockets = {}  # seller_name -> socket
+        self.verification_results = {}  # seller_name -> True/False
+
+        self.server_socket = None
+        self.server_thread = None
+
+    def start(self):
+        print("[Gateway] Starting server...")
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen()
+        self.server_thread = threading.Thread(target=self.accept_loop, daemon=True)
+        self.server_thread.start()
+
+    def accept_loop(self):
+        print(f"[Gateway] Listening on {self.host}:{self.port}")
+        while True:
+            conn, addr = self.server_socket.accept()
+            threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
+
+    def handle_client(self, conn: socket.socket, addr):
+        try:
+            # receive messages until closed
+            buffer = conn.recv(65536)
+            if not buffer:
+                conn.close()
+                return
+            msg = json.loads(buffer.decode())
+            mtype = msg.get('type')
+            if mtype == 'HELLO':
+                seller = msg.get('seller')
+                print(f"[Gateway] HELLO from {seller} at {addr}")
+                # store socket so we can send final signed summary later
+                with self.lock:
+                    self.client_sockets[seller] = conn
+                # respond with Paillier public key (n and g as decimal strings)
+                reply = {
+                    'type': 'PUBKEY',
+                    'n': str(self.paillier_pub.n),
+                    'g': str(self.paillier_pub.g),
+                }
+                conn.sendall(json.dumps(reply).encode())
+                # now wait for transactions message from this same socket
+                buffer = conn.recv(65536)
+                if not buffer:
+                    conn.close(); return
+                msg2 = json.loads(buffer.decode())
+                if msg2.get('type') == 'TRANSACTIONS':
+                    ciphers = msg2.get('ciphers')  # list of decimal strings
+                    seller_name = msg2.get('seller')
+                    print(f"[Gateway] Received {len(ciphers)} ciphertexts from {seller_name}")
+                    # convert back to int and decrypt each
+                    decrypted = []
+                    for cs in ciphers:
+                        ci = int(cs)
+                        m = paillier_decrypt(self.paillier_priv, ci)
+                        decrypted.append(int(m))
+                    # compute homomorphic total by multiplying ct's
+                    total_cipher = 1
+                    for cs in ciphers:
+                        total_cipher = paillier_homomorphic_add(self.paillier_pub, total_cipher, int(cs))
+                    total_decrypted = paillier_decrypt(self.paillier_priv, total_cipher)
+                    with self.lock:
+                        self.seller_data[seller_name] = {
+                            'ciphertexts': ciphers,
+                            'decrypted': decrypted,
+                            'total_cipher': str(total_cipher),
+                            'total_decrypted': int(total_decrypted)
+                        }
+                    print(f"[Gateway] Processed seller '{seller_name}': total {total_decrypted}")
+                    # If we have received all sellers, create and sign final summary and send to all connected clients
+                    with self.lock:
+                        if len(self.seller_data) == self.expected_sellers:
+                            print("[Gateway] All sellers processed. Building, signing, and distributing final summary...")
+                            summary = self.build_summary()
+                            signature = self.sign_summary(summary)
+                            envelope = {
+                                'type': 'SIGNED_SUMMARY',
+                                'summary': summary,
+                                'signature': signature.hex(),
+                                'rsa_pub_n': str(self.rsa_pub.n),
+                                'rsa_pub_e': str(self.rsa_pub.e)
+                            }
+                            # send to all clients
+                            for sname, sock in self.client_sockets.items():
+                                try:
+                                    sock.sendall(json.dumps(envelope).encode())
+                                except Exception as e:
+                                    print(f"[Gateway] Error sending signed summary to {sname}: {e}")
+                # after sending, listen for verification ack from this client
+                buffer = conn.recv(65536)
+                if buffer:
+                    msg3 = json.loads(buffer.decode())
+                    if msg3.get('type') == 'VERIFICATION':
+                        sname = msg3.get('seller')
+                        result = msg3.get('result')
+                        with self.lock:
+                            self.verification_results[sname] = bool(result)
+                            print(f"[Gateway] Received verification result from {sname}: {result}")
+                        # If we've got verification from all sellers, print final pretty summary
+                        with self.lock:
+                            if len(self.verification_results) == self.expected_sellers:
+                                self.print_final_report()
+            else:
+                conn.close()
+        except Exception as e:
+            print(f"[Gateway] Exception in handler: {e}")
+            try:
+                conn.close()
+            except:
+                pass
+
+    def build_summary(self):
+        # produce a deterministic string representation of the transaction summary
+        payload = {
+            'gateway': 'Demo Payment Gateway',
+            'sellers': []
+        }
+        # sort sellers for deterministic ordering
+        for seller in sorted(self.seller_data.keys()):
+            entry = {
+                'seller_name': seller,
+                'individual_decrypted': self.seller_data[seller]['decrypted'],
+                'individual_encrypted': self.seller_data[seller]['ciphertexts'],
+                'total_encrypted': self.seller_data[seller]['total_cipher'],
+                'total_decrypted': self.seller_data[seller]['total_decrypted']
+            }
+            payload['sellers'].append(entry)
+        # canonical JSON string (sorted keys)
+        summary_json = json.dumps(payload, sort_keys=True)
+        return summary_json
+
+    def sign_summary(self, summary_json: str):
+        h = SHA256.new(summary_json.encode())
+        signer = pkcs1_15.new(self.rsa_key)
+        sig = signer.sign(h)
+        return sig
+
+    def print_final_report(self):
+        print("\n" + "="*60)
+        print("FINAL TRANSACTION SUMMARY (Gateway view)")
+        print("="*60)
+        summary = json.loads(self.build_summary())
+        for s in summary['sellers']:
+            name = s['seller_name']
+            print(f"\nSeller: {name}")
+            print("  Individual Transaction Amounts (decrypted):", s['individual_decrypted'])
+            print("  Encrypted Transaction Amounts (big ints):")
+            for idx, c in enumerate(s['individual_encrypted'], start=1):
+                print(f"    {idx}. {c[:60]}...")  # print prefix for brevity
+            print("  Total Encrypted (big int):", s['total_encrypted'][:80] + "...")
+            print("  Total Decrypted:", s['total_decrypted'])
+            print("  Digital Signature Status: Signed by Gateway RSA key: True")
+            ver = self.verification_results.get(name, None)
+            print("  Signature Verification Result (as reported by seller):", ver)
+        print("\n[Gateway] All done. Closing server socket.")
+        try:
+            self.server_socket.close()
+        except:
+            pass
+
+# ---------------- Seller (Client) Implementation ----------------
+def seller_client(seller_name, host=HOST, port=PORT, transaction_amounts=None):
+    if transaction_amounts is None:
+        # default transactions if none provided
+        transaction_amounts = [random.randint(10, 500) for _ in range(2)]
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host, port))
+        # Send HELLO
+        hello = {'type': 'HELLO', 'seller': seller_name}
+        s.sendall(json.dumps(hello).encode())
+        # receive pubkey
+        buffer = s.recv(65536)
+        msg = json.loads(buffer.decode())
+        if msg.get('type') == 'PUBKEY':
+            n = int(msg['n'])
+            g = int(msg['g'])
+            paillier_pub = PaillierPublicKey(n, g)
+            # encrypt each transaction locally using gateway's public key
+            ciphers = []
+            for amt in transaction_amounts:
+                c = paillier_encrypt(paillier_pub, int(amt))
+                ciphers.append(str(c))
+            # send TRANSACTIONS message
+            txmsg = {'type': 'TRANSACTIONS', 'seller': seller_name, 'ciphers': ciphers}
+            s.sendall(json.dumps(txmsg).encode())
+            print(f"[{seller_name}] Sent {len(ciphers)} encrypted transactions to gateway.")
+            # wait for signed summary (gateway will send when all sellers done)
+            buffer = s.recv(2000000)
+            if not buffer:
+                print(f"[{seller_name}] No summary received.")
+                s.close(); return
+            env = json.loads(buffer.decode())
+            if env.get('type') == 'SIGNED_SUMMARY':
+                summary_json = env.get('summary')
+                signature = bytes.fromhex(env.get('signature'))
+                rsa_pub_n = int(env.get('rsa_pub_n'))
+                rsa_pub_e = int(env.get('rsa_pub_e'))
+                # verify signature using provided rsa public components
+                rsa_pub = RSA.construct((rsa_pub_n, rsa_pub_e))
+                h = SHA256.new(summary_json.encode())
+                try:
+                    pkcs1_15.new(rsa_pub).verify(h, signature)
+                    verified = True
+                    print(f"[{seller_name}] Signature verification: SUCCESS")
+                except (ValueError, TypeError):
+                    verified = False
+                    print(f"[{seller_name}] Signature verification: FAILED")
+                # send back verification result
+                ack = {'type': 'VERIFICATION', 'seller': seller_name, 'result': verified}
+                s.sendall(json.dumps(ack).encode())
+                # also print local view of relevant part of summary
+                parsed = json.loads(summary_json)
+                # find this seller's record
+                my_entry = None
+                for e in parsed['sellers']:
+                    if e['seller_name'] == seller_name:
+                        my_entry = e
+                        break
+                if my_entry:
+                    print(f"\n[{seller_name}] Local view from summary:")
+                    print("  Individual Decrypted:", my_entry['individual_decrypted'])
+                    print("  Total Decrypted:", my_entry['total_decrypted'])
+                else:
+                    print(f"[{seller_name}] No entry found in summary!")
+        s.close()
+    except Exception as e:
+        print(f"[{seller_name}] Exception: {e}")
+
+# ---------------- Demo runner ----------------
+def run_demo():
+    # launch gateway and two sellers (minimum)
+    gateway = GatewayServer(expected_sellers=2)
+    gateway.start()
+    # Give server time to start
+    time.sleep(1)
+
+    # Sellers and their transactions (you can change as needed)
+    sellers = {
+        'Seller_A': [120, 250],
+        'Seller_B': [35, 45, 100]
+    }
+
+    # Start seller clients in threads
+    threads = []
+    for name, amounts in sellers.items():
+        t = threading.Thread(target=seller_client, args=(name, HOST, PORT, amounts), daemon=True)
+        t.start()
+        threads.append(t)
+        time.sleep(0.5)  # little spacing
+
+    # wait for children to finish
+    for t in threads:
+        t.join(timeout=10)
+
+    # give gateway a moment to print final results
+    time.sleep(2)
+
+if __name__ == '__main__':
+    run_demo()
